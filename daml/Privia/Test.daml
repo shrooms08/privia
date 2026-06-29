@@ -32,8 +32,11 @@ testDoubleFinancePrevented = script do
               financier = financierB; supplier; invoiceCid = ackInv
               advanceAmount = 96.0; advanceCashCid = cashB; currency = "USD")
 
-  -- Accept offer A: succeeds, consuming the invoice.
-  _ <- submit supplier (exerciseCmd offerA FinancingOffer_Accept)
+  -- Accept offer A: succeeds, consuming the invoice. The financier explicitly
+  -- discloses its advance cash to the supplier so the atomic DvP transfer is
+  -- visible to the accepting party (Canton shares nothing unless disclosed).
+  Some cashADisc <- queryDisclosure financierA cashA
+  _ <- submitWithDisclosures supplier [cashADisc] (exerciseCmd offerA FinancingOffer_Accept)
 
   -- Accept offer B on the now-consumed invoice: MUST FAIL.
   submitMustFail supplier (exerciseCmd offerB FinancingOffer_Accept)
