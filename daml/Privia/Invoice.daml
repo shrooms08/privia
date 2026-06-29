@@ -1,0 +1,35 @@
+module Privia.Invoice where
+
+-- An invoice issued by a supplier against a buyer.
+template Invoice
+  with
+    supplier : Party
+    buyer : Party
+    invoiceId : Text
+    faceAmount : Decimal
+    currency : Text
+    dueDate : Date
+  where
+    signatory supplier
+    observer buyer
+    ensure faceAmount > 0.0
+
+    -- Buyer confirms the debt is real. Prevents fake-invoice fraud.
+    choice Invoice_Acknowledge : ContractId AcknowledgedInvoice
+      controller buyer
+      do create AcknowledgedInvoice with
+           supplier; buyer; invoiceId; faceAmount; currency; dueDate
+
+-- A buyer-confirmed receivable. Financing CONSUMES this contract, which is
+-- what structurally prevents the same invoice being financed twice.
+template AcknowledgedInvoice
+  with
+    supplier : Party
+    buyer : Party
+    invoiceId : Text
+    faceAmount : Decimal
+    currency : Text
+    dueDate : Date
+  where
+    signatory supplier
+    observer buyer

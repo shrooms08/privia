@@ -1,0 +1,41 @@
+module Privia.Test where
+
+import Daml.Script
+import DA.Date
+import Privia.Cash
+import Privia.Invoice
+import Privia.Financing
+
+-- Core thesis: an acknowledged invoice can be financed once; a second attempt
+-- to finance the same invoice is rejected.
+testDoubleFinancePrevented : Script ()
+testDoubleFinancePrevented = script do
+  supplier   <- allocateParty "Supplier"
+  buyer      <- allocateParty "Buyer"
+  bank       <- allocateParty "SettlementBank"
+  financierA <- allocateParty "FinancierA"
+  financierB <- allocateParty "FinancierB"
+
+  let due = date 2026 Dec 31
+
+  cashA <- submit bank (createCmd Cash with issuer = bank; owner = financierA; amount = 95.0; currency = "USD")
+  cashB <- submit bank (createCmd Cash with issuer = bank; owner = financierB; amount = 96.0; currency = "USD")
+
+  inv <- submit supplier (createCmd Invoice with
+           supplier; buyer; invoiceId = "INV-001"; faceAmount = 100.0; currency = "USD"; dueDate = due)
+  ackInv <- submit buyer (exerciseCmd inv Invoice_Acknowledge)
+
+  offerA <- submit financierA (createCmd FinancingOffer with
+              financier = financierA; supplier; invoiceCid = ackInv
+              advanceAmount = 95.0; advanceCashCid = cashA; currency = "USD")
+  offerB <- submit financierB (createCmd FinancingOffer with
+              financier = financierB; supplier; invoiceCid = ackInv
+              advanceAmount = 96.0; advanceCashCid = cashB; currency = "USD")
+
+  -- Accept offer A: succeeds, consuming the invoice.
+  _ <- submit supplier (exerciseCmd offerA FinancingOffer_Accept)
+
+  -- Accept offer B on the now-consumed invoice: MUST FAIL.
+  submitMustFail supplier (exerciseCmd offerB FinancingOffer_Accept)
+
+  pure ()

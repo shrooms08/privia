@@ -1,0 +1,53 @@
+module Privia.Financing where
+
+import Privia.Cash
+import Privia.Invoice
+
+-- A financier's offer to advance cash against an acknowledged invoice.
+template FinancingOffer
+  with
+    financier : Party
+    supplier : Party
+    invoiceCid : ContractId AcknowledgedInvoice
+    advanceAmount : Decimal
+    advanceCashCid : ContractId Cash
+    currency : Text
+  where
+    signatory financier
+    observer supplier
+
+    choice FinancingOffer_Accept : (ContractId FinancedReceivable, ContractId Cash)
+      controller supplier
+      do
+        inv <- fetch invoiceCid
+        -- Consume the acknowledged invoice. If already financed (consumed by
+        -- another accepted offer), this fails. Double-financing is impossible
+        -- by construction, not by detection.
+        archive invoiceCid
+        -- Atomic delivery-versus-payment: cash to supplier in the same tx.
+        advancedCash <- exercise advanceCashCid Cash_Transfer with newOwner = supplier
+        rcv <- create FinancedReceivable with
+                 financier; supplier; buyer = inv.buyer
+                 invoiceId = inv.invoiceId; faceAmount = inv.faceAmount
+                 currency = inv.currency; dueDate = inv.dueDate; advanceAmount
+        pure (rcv, advancedCash)
+
+-- The financier now owns the right to collect from the buyer at maturity.
+template FinancedReceivable
+  with
+    financier : Party
+    supplier : Party
+    buyer : Party
+    invoiceId : Text
+    faceAmount : Decimal
+    currency : Text
+    dueDate : Date
+    advanceAmount : Decimal
+  where
+    signatory financier, supplier
+    observer buyer
+
+    choice FinancedReceivable_Settle : ContractId Cash
+      with paymentCid : ContractId Cash
+      controller buyer
+      do exercise paymentCid Cash_Transfer with newOwner = financier
