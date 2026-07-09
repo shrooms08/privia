@@ -2,21 +2,30 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
+  acceptBid,
+  acknowledgeInvoice,
   ActiveContract,
   createContract,
-  exerciseChoice,
+  dismissOutcome,
   LedgerApiError,
   listParties,
+  openAuction,
   PartyInfo,
+  placeBid,
   queryActiveContracts,
+  reviseBid,
+  settleReceivable,
   templateKeyOf,
 } from "@/lib/ledger";
 import {
   AcknowledgedInvoice,
+  Auction,
+  Bid,
+  BidInvite,
   Cash,
   FinancedReceivable,
-  FinancingOffer,
   Invoice,
+  OfferOutcome,
   TemplateKey,
 } from "@/lib/types";
 
@@ -42,18 +51,18 @@ const PERSONAS = [
   {
     key: "FinancierA",
     label: "Financier A",
-    role: "Advances funds against confirmed invoices",
+    role: "Bids to advance funds against confirmed invoices",
     accent: "#2F5A8C",
     empty:
-      "Nothing visible yet. You'll see receivables only after the buyer confirms them — never unverified invoices.",
+      "Nothing visible yet. You'll see receivables and auction invites only after the buyer confirms the debt.",
   },
   {
     key: "FinancierB",
     label: "Financier B",
-    role: "Competing financier",
+    role: "Competing lender",
     accent: "#6B4A8C",
     empty:
-      "Nothing visible yet. You'll see receivables only after the buyer confirms them — never unverified invoices.",
+      "Nothing visible yet. You'll see receivables and auction invites only after the buyer confirms the debt.",
   },
 ] as const;
 
@@ -89,12 +98,18 @@ const isStaleContractError = (e: unknown) =>
 
 // ---------- lifecycle tracker ----------
 
-const STAGES = ["Issued", "Acknowledged", "Offers in", "Financed", "Settled"] as const;
+const STAGES = [
+  "Issued",
+  "Acknowledged",
+  "Auction open",
+  "Bids in",
+  "Financed",
+  "Settled",
+] as const;
 
 // Derives each deal's stage from what this persona actually sees on-ledger.
-// `settledIds` is a session-local record of settles we performed and the
-// ledger confirmed — settlement consumes the receivable, so it can't be read
-// back from the ACS.
+// `settledIds` is a session-local record of settles the ledger confirmed —
+// settlement consumes the receivable, so it can't be read back from the ACS.
 function dealStages(
   groups: Partial<Record<TemplateKey, ActiveContract[]>>,
   settledIds: Set<string>,
@@ -105,16 +120,18 @@ function dealStages(
 
   for (const c of groups.Invoice ?? [])
     bump((c.payload as unknown as Invoice).invoiceId, 1);
-  for (const c of groups.AcknowledgedInvoice ?? []) {
-    const inv = c.payload as unknown as AcknowledgedInvoice;
-    const hasOffers = (groups.FinancingOffer ?? []).some(
-      (o) => (o.payload as unknown as FinancingOffer).invoiceCid === c.contractId,
+  for (const c of groups.AcknowledgedInvoice ?? [])
+    bump((c.payload as unknown as AcknowledgedInvoice).invoiceId, 2);
+  for (const c of groups.Auction ?? []) {
+    const a = c.payload as unknown as Auction;
+    const hasBids = (groups.Bid ?? []).some(
+      (b) => (b.payload as unknown as Bid).auctionCid === c.contractId,
     );
-    bump(inv.invoiceId, hasOffers ? 3 : 2);
+    bump(a.invoiceId, hasBids ? 4 : 3);
   }
   for (const c of groups.FinancedReceivable ?? [])
-    bump((c.payload as unknown as FinancedReceivable).invoiceId, 4);
-  for (const id of settledIds) bump(id, 5);
+    bump((c.payload as unknown as FinancedReceivable).invoiceId, 5);
+  for (const id of settledIds) bump(id, 6);
 
   return [...deals.entries()]
     .map(([invoiceId, stage]) => ({ invoiceId, stage }))
@@ -176,6 +193,19 @@ export default function PriviaApp() {
     [groups, settledIds],
   );
 
+  // Sealed-bid joins over this persona's real ACS. A financier's ACS simply
+  // does not contain rival bids, so these joins can't leak anything.
+  const bidsFor = (auctionCid: string) =>
+    (groups.Bid ?? []).filter(
+      (b) => (b.payload as unknown as Bid).auctionCid === auctionCid,
+    );
+  const inviteFor = (auctionCid: string) =>
+    (groups.BidInvite ?? []).find(
+      (i) =>
+        (i.payload as unknown as BidInvite).auctionCid === auctionCid &&
+        (i.payload as unknown as BidInvite).financier === me,
+    );
+
   const act = async (label: string, fn: () => Promise<unknown>) => {
     setBusy(true);
     setError(null);
@@ -198,74 +228,76 @@ export default function PriviaApp() {
 
   // -- persona actions --
 
-  const acknowledge = (c: ActiveContract) =>
-    act("Invoice acknowledged. The debt is now confirmed on-ledger.", () =>
-      exerciseChoice("Invoice", c.contractId, "Invoice_Acknowledge", {}, me!),
-    );
-
-  const makeOffer = (c: ActiveContract, advanceAmount: string) =>
-    act("Offer submitted. Only you and the supplier can see it.", () =>
-      createContract(
-        "FinancingOffer",
-        {
-          financier: me!,
-          supplier: (c.payload as unknown as AcknowledgedInvoice).supplier,
-          invoiceCid: c.contractId,
-          advanceAmount: asDecimal(advanceAmount),
-          currency: (c.payload as unknown as AcknowledgedInvoice).currency,
-        },
-        me!,
-      ),
-    );
-
-  const acceptOffer = (c: ActiveContract) =>
-    act(
-      "Offer accepted. Receivable transferred and cash advanced in one atomic transaction.",
-      () =>
-        exerciseChoice(
-          "FinancingOffer",
-          c.contractId,
-          "FinancingOffer_Accept",
-          {},
-          me!,
-        ),
-    );
-
-  const settle = (c: ActiveContract) => {
-    const rcv = c.payload as unknown as FinancedReceivable;
-    return act("Receivable settled. Payment delivered to the financier.", async () => {
-      await createContract(
-        "Cash",
-        { issuer: me!, owner: me!, amount: rcv.faceAmount, currency: rcv.currency },
-        me!,
-      );
-      // submit-and-wait doesn't return contract IDs; find the fresh Cash in the ACS.
-      const acs = await queryActiveContracts(me!);
-      const payment = acs.find(
-        (x) =>
-          templateKeyOf(x.templateId) === "Cash" &&
-          (x.payload as unknown as Cash).owner === me &&
-          parseFloat((x.payload as unknown as Cash).amount) ===
-            parseFloat(rcv.faceAmount),
-      );
-      if (!payment) throw new Error("Payment cash not found after creation.");
-      await exerciseChoice(
-        "FinancedReceivable",
-        c.contractId,
-        "FinancedReceivable_Settle",
-        { paymentCid: payment.contractId },
-        me!,
-      );
-      setSettledIds((s) => new Set(s).add(rcv.invoiceId));
-    });
-  };
-
-  const issueInvoice = (args: Record<string, unknown>) =>
+  const issue = (args: Record<string, unknown>) =>
     act("Invoice issued. It is now visible to the buyer — and no one else.", () =>
       createContract("Invoice", args, me!),
     );
 
+  const acknowledge = (c: ActiveContract) =>
+    act("Invoice acknowledged. The debt is now confirmed on-ledger.", () =>
+      acknowledgeInvoice(c.contractId, me!),
+    );
+
+  const open = (c: ActiveContract) =>
+    act(
+      "Auction opened. Each invited financier received a sealed bid invite.",
+      () => openAuction(me!, c),
+    );
+
+  const bid = (inviteCid: string, amount: string) =>
+    act("Bid placed. Only you and the supplier can see the amount.", () =>
+      placeBid(inviteCid, asDecimal(amount), me!),
+    );
+
+  const revise = (bidCid: string, amount: string) =>
+    act("Bid revised. Your previous bid was replaced, not duplicated.", () =>
+      reviseBid(bidCid, asDecimal(amount), me!),
+    );
+
+  const accept = (auctionCid: string, winning: ActiveContract) =>
+    act(
+      "Bid accepted. Cash advanced, receivable transferred, and every financier notified — one atomic transaction.",
+      () =>
+        acceptBid(
+          auctionCid,
+          winning.contractId,
+          bidsFor(auctionCid)
+            .filter((b) => b.contractId !== winning.contractId)
+            .map((b) => b.contractId),
+          me!,
+        ),
+    );
+
+  const dismiss = (c: ActiveContract) =>
+    act("Notice dismissed.", () => dismissOutcome(c.contractId, me!));
+
+  const settle = (c: ActiveContract) => {
+    const rcv = c.payload as unknown as FinancedReceivable;
+    return act(
+      "Receivable settled. Payment delivered to the financier.",
+      async () => {
+        await createContract(
+          "Cash",
+          { issuer: me!, owner: me!, amount: rcv.faceAmount, currency: rcv.currency },
+          me!,
+        );
+        const acs = await queryActiveContracts(me!);
+        const payment = acs.find(
+          (x) =>
+            templateKeyOf(x.templateId) === "Cash" &&
+            (x.payload as unknown as Cash).owner === me &&
+            parseFloat((x.payload as unknown as Cash).amount) ===
+              parseFloat(rcv.faceAmount),
+        );
+        if (!payment) throw new Error("Payment cash not found after creation.");
+        await settleReceivable(c.contractId, payment.contractId, me!);
+        setSettledIds((s) => new Set(s).add(rcv.invoiceId));
+      },
+    );
+  };
+
   const isEmpty = !loading && contracts.length === 0;
+  const isFinancier = personaKey === "FinancierA" || personaKey === "FinancierB";
 
   return (
     <div className="min-h-screen">
@@ -277,7 +309,6 @@ export default function PriviaApp() {
           busy={busy}
         />
 
-        {/* keyed by persona so the whole view re-enters on identity change */}
         <div key={personaKey} className="enter-view">
           {rejection && <RejectionBanner />}
           {lastSuccess && <SuccessBanner message={lastSuccess} />}
@@ -290,6 +321,53 @@ export default function PriviaApp() {
               <PrivacyStrip persona={persona} groups={groups} />
               {deals.length > 0 && <LifecycleTracker deals={deals} />}
 
+              {/* Outcome notices — a financier's inbox, right up top. */}
+              {isFinancier && (groups.OfferOutcome ?? []).length > 0 && (
+                <div className="mt-6 space-y-3">
+                  {(groups.OfferOutcome ?? []).map((c) => {
+                    const o = c.payload as unknown as OfferOutcome;
+                    const won = o.result === "Won";
+                    return (
+                      <div
+                        key={c.contractId}
+                        role="status"
+                        className={`enter-banner flex items-center justify-between gap-4 rounded-2xl px-5 py-4 ${
+                          won
+                            ? "bg-brand text-white shadow-md"
+                            : "border border-brand-dark/15 bg-white text-brand-dark"
+                        }`}
+                      >
+                        <div>
+                          <div className="text-sm font-bold">
+                            {won
+                              ? `You won ${o.invoiceId}.`
+                              : `Not selected for ${o.invoiceId}.`}
+                          </div>
+                          <p
+                            className={`text-sm ${won ? "text-white/85" : "text-brand-dark/60"}`}
+                          >
+                            {won && o.amount
+                              ? `Your ${fmtMoney(o.amount, "USD").replace(" USD", "")} advance was delivered to the supplier and the receivable is yours at maturity.`
+                              : "This invoice was financed by another lender. Their terms were not disclosed to you."}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => dismiss(c)}
+                          disabled={busy}
+                          className={`min-h-10 shrink-0 cursor-pointer rounded-xl px-4 py-2 text-sm font-semibold transition-colors duration-100 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 active:translate-y-px disabled:opacity-40 ${
+                            won
+                              ? "bg-white/15 text-white hover:bg-white/25 focus-visible:ring-white focus-visible:ring-offset-brand"
+                              : "bg-brand-dark/5 text-brand-dark hover:bg-brand-dark/10 focus-visible:ring-brand focus-visible:ring-offset-white"
+                          }`}
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
               <div className="mt-10 space-y-12">
                 {personaKey === "Supplier" && (
                   <IssueInvoiceForm
@@ -299,7 +377,7 @@ export default function PriviaApp() {
                       p.displayName.startsWith("Financier"),
                     )}
                     busy={busy}
-                    onSubmit={issueInvoice}
+                    onSubmit={issue}
                   />
                 )}
 
@@ -320,9 +398,7 @@ export default function PriviaApp() {
                         <Field k="Due" v={inv.dueDate} />
                         <Field
                           k="Invited financiers"
-                          v={
-                            inv.financiers?.map(shortParty).join(", ") || "none"
-                          }
+                          v={inv.financiers?.map(shortParty).join(", ") || "none"}
                         />
                         {personaKey === "Buyer" && (
                           <ActionButton
@@ -338,7 +414,7 @@ export default function PriviaApp() {
 
                 <Section
                   title="Confirmed receivables"
-                  hint="buyer-acknowledged, open for financing"
+                  hint="buyer-acknowledged, ready for a financing auction"
                 >
                   {(groups.AcknowledgedInvoice ?? []).map((c) => {
                     const inv = c.payload as unknown as AcknowledgedInvoice;
@@ -352,13 +428,11 @@ export default function PriviaApp() {
                         <Field k="Supplier" v={shortParty(inv.supplier)} />
                         <Field k="Buyer" v={shortParty(inv.buyer)} />
                         <Field k="Due" v={inv.dueDate} />
-                        {(personaKey === "FinancierA" ||
-                          personaKey === "FinancierB") && (
-                          <OfferForm
+                        {personaKey === "Supplier" && (
+                          <ActionButton
                             busy={busy}
-                            faceAmount={inv.faceAmount}
-                            currency={inv.currency}
-                            onOffer={(amt) => makeOffer(c, amt)}
+                            onClick={() => open(c)}
+                            label="Open financing auction"
                           />
                         )}
                       </Card>
@@ -366,30 +440,104 @@ export default function PriviaApp() {
                   })}
                 </Section>
 
-                <Section title="Financing offers" hint="advance terms on the table">
-                  {(groups.FinancingOffer ?? []).map((c) => {
-                    const o = c.payload as unknown as FinancingOffer;
+                <Section
+                  title="Sealed-bid auctions"
+                  hint={
+                    personaKey === "Supplier"
+                      ? "you see every bid; bidders see only their own"
+                      : "your bid is visible only to you and the supplier"
+                  }
+                >
+                  {(groups.Auction ?? []).map((c) => {
+                    const a = c.payload as unknown as Auction;
+                    const auctionBids = bidsFor(c.contractId);
+                    const myInvite = inviteFor(c.contractId);
+                    const myBid = auctionBids.find(
+                      (b) => (b.payload as unknown as Bid).financier === me,
+                    );
                     return (
-                      <Card key={c.contractId}>
+                      <Card key={c.contractId} wide>
                         <CardTitle
-                          title={`Offer · ${shortParty(o.financier)}`}
-                          badge={
-                            personaKey === "Supplier" ? "your decision" : "pending"
-                          }
-                          amount={fmtMoney(o.advanceAmount, o.currency)}
+                          title={`Auction · ${a.invoiceId}`}
+                          badge={`${a.financiers.length} lenders invited`}
+                          amount={fmtMoney(a.faceAmount, a.currency)}
                         />
-                        <Field k="Financier" v={shortParty(o.financier)} />
-                        <Field k="To" v={shortParty(o.supplier)} />
-                        <Field
-                          k="Advance"
-                          v={fmtMoney(o.advanceAmount, o.currency)}
-                        />
+                        <Field k="Due" v={a.dueDate} />
+
                         {personaKey === "Supplier" && (
-                          <ActionButton
-                            busy={busy}
-                            onClick={() => acceptOffer(c)}
-                            label="Accept offer"
-                          />
+                          <div className="mt-3 space-y-2">
+                            {a.financiers.map((f) => {
+                              const fBid = auctionBids.find(
+                                (b) =>
+                                  (b.payload as unknown as Bid).financier === f,
+                              );
+                              const fb = fBid?.payload as unknown as
+                                | Bid
+                                | undefined;
+                              return (
+                                <div
+                                  key={f}
+                                  className="flex items-center justify-between gap-3 rounded-xl bg-brand-soft/50 px-4 py-2.5"
+                                >
+                                  <span className="text-sm font-semibold text-brand-dark">
+                                    {shortParty(f)}
+                                  </span>
+                                  {fBid && fb ? (
+                                    <span className="flex items-center gap-3">
+                                      <span className="font-mono text-sm font-bold tabular-nums text-brand">
+                                        {fmtMoney(fb.amount, fb.currency)}
+                                      </span>
+                                      <button
+                                        onClick={() => accept(c.contractId, fBid)}
+                                        disabled={busy}
+                                        className="min-h-9 cursor-pointer rounded-lg bg-brand px-3 py-1.5 text-xs font-semibold text-white transition-colors duration-100 ease-out hover:bg-brand/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2 active:translate-y-px disabled:opacity-40"
+                                      >
+                                        Accept this bid
+                                      </button>
+                                    </span>
+                                  ) : (
+                                    <span className="text-sm text-brand-dark/45">
+                                      No bid yet
+                                    </span>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {isFinancier && (
+                          <div className="mt-3">
+                            {myBid ? (
+                              <BidPanel
+                                label="Your sealed bid"
+                                current={fmtMoney(
+                                  (myBid.payload as unknown as Bid).amount,
+                                  (myBid.payload as unknown as Bid).currency,
+                                )}
+                                initial={(myBid.payload as unknown as Bid).amount}
+                                cta="Revise bid"
+                                busy={busy}
+                                onSubmit={(amt) => revise(myBid.contractId, amt)}
+                              />
+                            ) : myInvite ? (
+                              <BidPanel
+                                label="You're invited to bid"
+                                initial={(parseFloat(a.faceAmount) * 0.95).toFixed(2)}
+                                cta="Place sealed bid"
+                                busy={busy}
+                                onSubmit={(amt) => bid(myInvite.contractId, amt)}
+                              />
+                            ) : (
+                              <p className="text-sm text-brand-dark/50">
+                                Bid submitted or invite used.
+                              </p>
+                            )}
+                            <p className="mt-2 text-xs text-brand-dark/45">
+                              Sealed auction: other lenders cannot see your
+                              amount — or that you bid at all.
+                            </p>
+                          </div>
                         )}
                       </Card>
                     );
@@ -413,10 +561,7 @@ export default function PriviaApp() {
                           k="Advanced"
                           v={fmtMoney(r.advanceAmount, r.currency)}
                         />
-                        <Field
-                          k="Buyer owes"
-                          v={fmtMoney(r.faceAmount, r.currency)}
-                        />
+                        <Field k="Buyer owes" v={fmtMoney(r.faceAmount, r.currency)} />
                         <Field k="Due" v={r.dueDate} />
                         {personaKey === "Buyer" && (
                           <ActionButton
@@ -621,10 +766,10 @@ function RejectionBanner() {
             Double-financing blocked.
           </div>
           <p className="mt-2 max-w-2xl text-sm leading-relaxed text-white/80">
-            This offer referenced an invoice the ledger already consumed when a
-            competing offer was accepted. The same receivable cannot be sold
-            twice — not because a rule checked for it, but because the contract
-            no longer exists.
+            This bid referenced an invoice the ledger already consumed when the
+            winning bid was accepted. The same receivable cannot be sold twice
+            — not because a rule checked for it, but because the contract no
+            longer exists.
           </p>
         </div>
       </div>
@@ -675,7 +820,10 @@ function PrivacyStrip({
     [
       ["Invoice", "invoice"],
       ["AcknowledgedInvoice", "confirmed receivable"],
-      ["FinancingOffer", "financing offer"],
+      ["Auction", "auction"],
+      ["BidInvite", "bid invite"],
+      ["Bid", "sealed bid"],
+      ["OfferOutcome", "outcome notice"],
       ["FinancedReceivable", "financed receivable"],
       ["Cash", "cash holding"],
     ] as [TemplateKey, string][]
@@ -685,13 +833,13 @@ function PrivacyStrip({
 
   const hidden: Record<PersonaKey, string> = {
     Supplier:
-      "financiers' books and quotes they haven't sent you, the buyer's other liabilities.",
+      "financiers' books beyond their bids to you; the buyer never learns your funding costs.",
     Buyer:
-      "financing offers and advance terms — the supplier's funding costs are not the buyer's business.",
+      "auctions, bids, and advance terms — the supplier's funding costs are not the buyer's business.",
     FinancierA:
-      "Financier B's competing offers and terms, the supplier's other receivables and cash.",
+      "other lenders' bids, whether they bid at all, and the winning terms unless you won.",
     FinancierB:
-      "Financier A's competing offers and terms, the supplier's other receivables and cash.",
+      "other lenders' bids, whether they bid at all, and the winning terms unless you won.",
   };
 
   return (
@@ -767,9 +915,13 @@ function Section({
   );
 }
 
-function Card({ children }: { children: React.ReactNode }) {
+function Card({ children, wide }: { children: React.ReactNode; wide?: boolean }) {
   return (
-    <div className="rounded-2xl border border-brand-dark/10 bg-white p-5 shadow-sm">
+    <div
+      className={`rounded-2xl border border-brand-dark/10 bg-white p-5 shadow-sm ${
+        wide ? "sm:col-span-2" : ""
+      }`}
+    >
       {children}
     </div>
   );
@@ -832,49 +984,64 @@ function ActionButton({
   );
 }
 
-function OfferForm({
+// Place or revise a sealed bid.
+function BidPanel({
+  label,
+  current,
+  initial,
+  cta,
   busy,
-  faceAmount,
-  currency,
-  onOffer,
+  onSubmit,
 }: {
+  label: string;
+  current?: string;
+  initial: string;
+  cta: string;
   busy: boolean;
-  faceAmount: string;
-  currency: string;
-  onOffer: (amount: string) => void;
+  onSubmit: (amount: string) => void;
 }) {
-  const [amount, setAmount] = useState(
-    (parseFloat(faceAmount) * 0.95).toFixed(2),
-  );
+  const [amount, setAmount] = useState(parseFloat(initial).toFixed(2));
   return (
-    <form
-      className="mt-4 flex items-end gap-2"
-      onSubmit={(e) => {
-        e.preventDefault();
-        onOffer(amount);
-      }}
-    >
-      <label className="text-xs font-medium text-brand-dark/70">
-        Advance ({currency})
-        <input
-          type="number"
-          step="0.01"
-          min="0.01"
-          required
-          value={amount}
-          onChange={(e) => setAmount(e.target.value)}
-          className="mt-1 block w-32 rounded-xl border border-brand-dark/15 bg-white px-3 py-2 font-mono text-sm tabular-nums text-brand-dark focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand"
-        />
-      </label>
-      <button
-        type="submit"
-        disabled={busy}
-        aria-busy={busy}
-        className={`${buttonBase} flex-1 bg-brand px-4 py-2.5 hover:bg-brand/90`}
+    <div className="rounded-xl bg-brand-soft/50 p-4">
+      <div className="flex items-baseline justify-between">
+        <span className="text-xs font-bold uppercase tracking-wide text-brand-dark/60">
+          {label}
+        </span>
+        {current && (
+          <span className="font-mono text-sm font-bold tabular-nums text-brand">
+            {current}
+          </span>
+        )}
+      </div>
+      <form
+        className="mt-3 flex items-end gap-2"
+        onSubmit={(e: FormEvent) => {
+          e.preventDefault();
+          onSubmit(amount);
+        }}
       >
-        {busy ? "Submitting…" : "Make offer"}
-      </button>
-    </form>
+        <label className="text-xs font-medium text-brand-dark/70">
+          Advance amount
+          <input
+            type="number"
+            step="0.01"
+            min="0.01"
+            required
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            className="mt-1 block w-36 rounded-xl border border-brand-dark/15 bg-white px-3 py-2 font-mono text-sm tabular-nums text-brand-dark focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand"
+          />
+        </label>
+        <button
+          type="submit"
+          disabled={busy}
+          aria-busy={busy}
+          className={`${buttonBase} flex-1 bg-brand px-4 py-2.5 hover:bg-brand/90`}
+        >
+          {busy ? "Submitting…" : cta}
+        </button>
+      </form>
+    </div>
   );
 }
 
