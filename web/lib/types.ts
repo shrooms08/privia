@@ -16,6 +16,7 @@ export interface Invoice {
   faceAmount: Decimal;
   currency: string;
   dueDate: DamlDate;
+  financiers: Party[];
 }
 
 export interface AcknowledgedInvoice {
@@ -25,6 +26,7 @@ export interface AcknowledgedInvoice {
   faceAmount: Decimal;
   currency: string;
   dueDate: DamlDate;
+  financiers: Party[];
 }
 
 export interface FinancingOffer {
@@ -32,7 +34,6 @@ export interface FinancingOffer {
   supplier: Party;
   invoiceCid: ContractId;
   advanceAmount: Decimal;
-  advanceCashCid: ContractId;
   currency: string;
 }
 

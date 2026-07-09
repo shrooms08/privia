@@ -12,31 +12,35 @@ testDoubleFinancePrevented : Script ()
 testDoubleFinancePrevented = script do
   supplier   <- allocateParty "Supplier"
   buyer      <- allocateParty "Buyer"
-  bank       <- allocateParty "SettlementBank"
   financierA <- allocateParty "FinancierA"
   financierB <- allocateParty "FinancierB"
 
   let due = date 2026 Dec 31
 
-  cashA <- submit bank (createCmd Cash with issuer = bank; owner = financierA; amount = 95.0; currency = "USD")
-  cashB <- submit bank (createCmd Cash with issuer = bank; owner = financierB; amount = 96.0; currency = "USD")
-
   inv <- submit supplier (createCmd Invoice with
-           supplier; buyer; invoiceId = "INV-001"; faceAmount = 100.0; currency = "USD"; dueDate = due)
+           supplier; buyer; invoiceId = "INV-001"; faceAmount = 100.0; currency = "USD"; dueDate = due
+           financiers = [financierA, financierB])
   ackInv <- submit buyer (exerciseCmd inv Invoice_Acknowledge)
 
   offerA <- submit financierA (createCmd FinancingOffer with
               financier = financierA; supplier; invoiceCid = ackInv
-              advanceAmount = 95.0; advanceCashCid = cashA; currency = "USD")
+              advanceAmount = 95.0; currency = "USD")
   offerB <- submit financierB (createCmd FinancingOffer with
               financier = financierB; supplier; invoiceCid = ackInv
-              advanceAmount = 96.0; advanceCashCid = cashB; currency = "USD")
+              advanceAmount = 96.0; currency = "USD")
 
-  -- Accept offer A: succeeds, consuming the invoice. The financier explicitly
-  -- discloses its advance cash to the supplier so the atomic DvP transfer is
-  -- visible to the accepting party (Canton shares nothing unless disclosed).
-  Some cashADisc <- queryDisclosure financierA cashA
-  _ <- submitWithDisclosures supplier [cashADisc] (exerciseCmd offerA FinancingOffer_Accept)
+  -- Accept offer A: succeeds, consuming the invoice and minting the
+  -- financier's cash IOU to the supplier atomically.
+  _ <- submit supplier (exerciseCmd offerA FinancingOffer_Accept)
+
+  -- The supplier now holds exactly the advanced cash, issued by financier A.
+  supplierCash <- queryFilter @Cash supplier (\c -> c.owner == supplier)
+  case supplierCash of
+    [(_, c)] -> do
+      assertMsg "advance must come from financier A" (c.issuer == financierA)
+      assertMsg "advance amount must match the offer" (c.amount == 95.0)
+      assertMsg "advance currency must match the offer" (c.currency == "USD")
+    _ -> assertFail "supplier should hold exactly one Cash after financing"
 
   -- Accept offer B on the now-consumed invoice: MUST FAIL.
   submitMustFail supplier (exerciseCmd offerB FinancingOffer_Accept)

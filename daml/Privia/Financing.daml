@@ -10,7 +10,6 @@ template FinancingOffer
     supplier : Party
     invoiceCid : ContractId AcknowledgedInvoice
     advanceAmount : Decimal
-    advanceCashCid : ContractId Cash
     currency : Text
   where
     signatory financier
@@ -24,8 +23,11 @@ template FinancingOffer
         -- another accepted offer), this fails. Double-financing is impossible
         -- by construction, not by detection.
         archive invoiceCid
-        -- Atomic delivery-versus-payment: cash to supplier in the same tx.
-        advancedCash <- exercise advanceCashCid Cash_Transfer with newOwner = supplier
+        -- Atomic delivery-versus-payment: the financier's cash IOU to the
+        -- supplier is minted in the same transaction as the receivable.
+        advancedCash <- create Cash with
+          issuer = financier; owner = supplier
+          amount = advanceAmount; currency
         rcv <- create FinancedReceivable with
                  financier; supplier; buyer = inv.buyer
                  invoiceId = inv.invoiceId; faceAmount = inv.faceAmount

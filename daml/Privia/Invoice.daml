@@ -1,6 +1,7 @@
 module Privia.Invoice where
 
--- An invoice issued by a supplier against a buyer.
+-- An invoice issued by a supplier against a buyer. The supplier names the
+-- financiers invited to bid; they see nothing until the buyer confirms.
 template Invoice
   with
     supplier : Party
@@ -9,6 +10,7 @@ template Invoice
     faceAmount : Decimal
     currency : Text
     dueDate : Date
+    financiers : [Party]
   where
     signatory supplier
     observer buyer
@@ -18,10 +20,12 @@ template Invoice
     choice Invoice_Acknowledge : ContractId AcknowledgedInvoice
       controller buyer
       do create AcknowledgedInvoice with
-           supplier; buyer; invoiceId; faceAmount; currency; dueDate
+           supplier; buyer; invoiceId; faceAmount; currency; dueDate; financiers
 
 -- A buyer-confirmed receivable. Financing CONSUMES this contract, which is
 -- what structurally prevents the same invoice being financed twice.
+-- Invited financiers observe it only from this point: they only ever see
+-- confirmed debt, never unverified invoices.
 template AcknowledgedInvoice
   with
     supplier : Party
@@ -30,6 +34,7 @@ template AcknowledgedInvoice
     faceAmount : Decimal
     currency : Text
     dueDate : Date
+    financiers : [Party]
   where
     signatory supplier
-    observer buyer
+    observer buyer, financiers
