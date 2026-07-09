@@ -1,0 +1,166 @@
+module Privia.Auction where
+
+import DA.Foldable (forA_)
+import Privia.Cash
+import Privia.Financing
+import Privia.Invoice
+
+data BidResult = Won | NotSelected
+  deriving (Eq, Show)
+
+-- A sealed-bid auction over one acknowledged invoice.
+--
+-- The Auction carries NO bid amounts: invited financiers observe it, so any
+-- amount stored here would be visible to all of them. Each bid lives in its
+-- own Bid contract whose only stakeholders are the bidding financier and the
+-- supplier — that is what keeps bidding sealed.
+template Auction
+  with
+    supplier : Party
+    invoiceCid : ContractId AcknowledgedInvoice
+    invoiceId : Text
+    faceAmount : Decimal
+    currency : Text
+    dueDate : Date
+    financiers : [Party]
+  where
+    signatory supplier
+    observer financiers
+
+    -- One BidInvite per invited financier. The invite is a financier's single,
+    -- consumable right to place a bid: placing consumes it, so a second
+    -- placement is structurally impossible (Daml 3.x has no contract keys to
+    -- enforce uniqueness, so uniqueness is a one-time-use contract instead).
+    nonconsuming choice Auction_CreateInvites : [ContractId BidInvite]
+      controller supplier
+      do
+        forA financiers \f ->
+          create BidInvite with
+            supplier; financier = f; auctionCid = self; invoiceCid; currency
+
+    -- Resolves the whole auction in one transaction: consumes the underlying
+    -- invoice (via Bid_Accept), mints the winner's cash IOU, creates the
+    -- receivable, retires the losing bids the supplier can see, and notifies
+    -- every invited financier of the outcome.
+    choice Auction_Accept : (ContractId FinancedReceivable, ContractId Cash)
+      with
+        winningBidCid : ContractId Bid
+        losingBidCids : [ContractId Bid]
+      controller supplier
+      do
+        winning <- fetch winningBidCid
+        assertMsg "winning bid must belong to this auction" (winning.auctionCid == self)
+        assertMsg "winning bidder must be invited" (winning.financier `elem` financiers)
+
+        -- Bid_Accept consumes the AcknowledgedInvoice: if it was already
+        -- financed through any path, this fails. Double-financing stays
+        -- impossible by construction, at the invoice level.
+        result <- exercise winningBidCid Bid_Accept
+
+        forA_ losingBidCids \lbCid -> do
+          lb <- fetch lbCid
+          assertMsg "losing bid must belong to this auction" (lb.auctionCid == self)
+          assertMsg "losing bid must not be the winner's" (lb.financier /= winning.financier)
+          exercise lbCid Bid_Retire
+
+        forA_ financiers \f ->
+          create OfferOutcome with
+            supplier; financier = f; invoiceId
+            result = if f == winning.financier then Won else NotSelected
+            amount = if f == winning.financier then Some winning.amount else None
+
+        pure result
+
+-- A financier's one-time right to place a bid in an auction. Visible only to
+-- the supplier and that financier; consumed on use.
+template BidInvite
+  with
+    supplier : Party
+    financier : Party
+    auctionCid : ContractId Auction
+    invoiceCid : ContractId AcknowledgedInvoice
+    currency : Text
+  where
+    signatory supplier
+    observer financier
+
+    choice BidInvite_PlaceBid : ContractId Bid
+      with amount : Decimal
+      controller financier
+      do
+        create Bid with
+          financier; supplier; auctionCid; invoiceCid; amount; currency
+
+-- A sealed bid. Signatory financier, observer supplier ONLY — other
+-- financiers are not stakeholders, so they can neither see this contract nor
+-- learn that it exists.
+template Bid
+  with
+    financier : Party
+    supplier : Party
+    auctionCid : ContractId Auction
+    invoiceCid : ContractId AcknowledgedInvoice
+    amount : Decimal
+    currency : Text
+  where
+    signatory financier
+    observer supplier
+    ensure amount > 0.0
+
+    -- Replace-not-add: revising consumes the old bid and creates the new one,
+    -- so a financier holds at most one live Bid per auction.
+    choice Bid_Revise : ContractId Bid
+      with newAmount : Decimal
+      controller financier
+      do create this with amount = newAmount
+
+    -- By bidding, the financier pre-authorizes settlement at their own price.
+    -- This choice runs with BOTH authorities in scope — supplier (controller)
+    -- and financier (Bid signatory) — which is what allows minting the
+    -- financier-issued Cash and the jointly-signed FinancedReceivable here,
+    -- where the supplier alone could not.
+    -- It also consumes the AcknowledgedInvoice itself, so EVERY acceptance
+    -- path destroys the invoice: no sequence of calls can finance it twice.
+    choice Bid_Accept : (ContractId FinancedReceivable, ContractId Cash)
+      controller supplier
+      do
+        inv <- fetch invoiceCid
+        assertMsg "bid supplier must match the invoice supplier" (inv.supplier == supplier)
+        archive invoiceCid
+        cash <- create Cash with
+          issuer = financier; owner = supplier; amount; currency
+        rcv <- create FinancedReceivable with
+          financier; supplier; buyer = inv.buyer
+          invoiceId = inv.invoiceId; faceAmount = inv.faceAmount
+          currency = inv.currency; dueDate = inv.dueDate; advanceAmount = amount
+        pure (rcv, cash)
+
+    -- Cleanup of losing bids at acceptance. The supplier cannot archive a
+    -- financier-signed contract directly, but the financier pre-agreed to
+    -- retirement by signing a template that carries this supplier-controlled
+    -- consuming choice.
+    choice Bid_Retire : ()
+      controller supplier
+      do pure ()
+
+    -- A financier can also withdraw their own bid.
+    choice Bid_Withdraw : ()
+      controller financier
+      do pure ()
+
+-- Per-financier auction result notice. Losers learn only that they were not
+-- selected — the winning amount is disclosed to the winner alone.
+template OfferOutcome
+  with
+    supplier : Party
+    financier : Party
+    invoiceId : Text
+    result : BidResult
+    amount : Optional Decimal
+  where
+    signatory supplier
+    observer financier
+
+    choice OfferOutcome_Dismiss : ()
+      controller financier
+      do pure ()

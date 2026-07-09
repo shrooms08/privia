@@ -1,15 +1,22 @@
 module Privia.Test where
 
-import Daml.Script
 import DA.Date
+import DA.Optional (isNone)
+import Daml.Script
+import Privia.Auction
 import Privia.Cash
-import Privia.Invoice
 import Privia.Financing
+import Privia.Invoice
 
--- Core thesis: an acknowledged invoice can be financed once; a second attempt
--- to finance the same invoice is rejected.
-testDoubleFinancePrevented : Script ()
-testDoubleFinancePrevented = script do
+-- Covers the full sealed-bid auction lifecycle and its guarantees:
+--   1. happy path (issue → acknowledge → auction → bids → accept → DvP)
+--   2. sealed bidding (a financier cannot see a rival's bid)
+--   3. one live bid per financier (structural, via consumable BidInvite)
+--   4. every invited financier gets an OfferOutcome on acceptance
+--   5. a financier can dismiss their own OfferOutcome
+--   6. double-financing still blocked at the invoice level
+testSealedBidAuction : Script ()
+testSealedBidAuction = script do
   supplier   <- allocateParty "Supplier"
   buyer      <- allocateParty "Buyer"
   financierA <- allocateParty "FinancierA"
@@ -17,32 +24,109 @@ testDoubleFinancePrevented = script do
 
   let due = date 2026 Dec 31
 
+  -- Issue and acknowledge.
   inv <- submit supplier (createCmd Invoice with
            supplier; buyer; invoiceId = "INV-001"; faceAmount = 100.0; currency = "USD"; dueDate = due
            financiers = [financierA, financierB])
   ackInv <- submit buyer (exerciseCmd inv Invoice_Acknowledge)
 
-  offerA <- submit financierA (createCmd FinancingOffer with
-              financier = financierA; supplier; invoiceCid = ackInv
-              advanceAmount = 95.0; currency = "USD")
-  offerB <- submit financierB (createCmd FinancingOffer with
-              financier = financierB; supplier; invoiceCid = ackInv
-              advanceAmount = 96.0; currency = "USD")
+  -- Open the auction and issue one BidInvite per invited financier.
+  auction <- submit supplier (createCmd Auction with
+               supplier; invoiceCid = ackInv; invoiceId = "INV-001"
+               faceAmount = 100.0; currency = "USD"; dueDate = due
+               financiers = [financierA, financierB])
+  [inviteA, inviteB] <- submit supplier (exerciseCmd auction Auction_CreateInvites)
 
-  -- Accept offer A: succeeds, consuming the invoice and minting the
-  -- financier's cash IOU to the supplier atomically.
-  _ <- submit supplier (exerciseCmd offerA FinancingOffer_Accept)
+  -- Financier A bids 90, then revises to 95.
+  bidA0 <- submit financierA (exerciseCmd inviteA BidInvite_PlaceBid with amount = 90.0)
+  bidA  <- submit financierA (exerciseCmd bidA0 Bid_Revise with newAmount = 95.0)
 
-  -- The supplier now holds exactly the advanced cash, issued by financier A.
+  -- (3) ONE LIVE BID PER FINANCIER. Revising replaced the bid rather than
+  -- adding one, and the invite was consumed on first use, so placing again
+  -- is structurally impossible.
+  aBids <- query @Bid financierA
+  case aBids of
+    [(cid, b)] -> do
+      assertMsg "revise must replace, not add" (cid == bidA)
+      assertMsg "revised amount must be live" (b.amount == 95.0)
+    _ -> assertFail "financier A must hold exactly one live bid"
+  submitMustFail financierA (exerciseCmd inviteA BidInvite_PlaceBid with amount = 80.0)
+
+  -- Financier B bids 96.
+  bidB <- submit financierB (exerciseCmd inviteB BidInvite_PlaceBid with amount = 96.0)
+
+  -- (2) THE SEALED-BID PROOF. A Bid's only stakeholders are its financier and
+  -- the supplier, so financier B's view of the ledger contains exactly one
+  -- Bid — their own. Financier A's 95.0 bid does not exist for B: B cannot
+  -- read its amount, nor even learn that it exists.
+  bBids <- query @Bid financierB
+  case bBids of
+    [(cid, b)] -> do
+      assertMsg "B sees only their own bid" (cid == bidB && b.financier == financierB)
+      assertMsg "B sees only their own amount" (b.amount == 96.0)
+    _ -> assertFail "financier B must see exactly one bid: their own"
+  -- B cannot act on A's bid either — B is not a stakeholder of it.
+  submitMustFail financierB (exerciseCmd bidA Bid_Revise with newAmount = 1.0)
+  -- The supplier, as observer of every bid, sees both.
+  supplierBids <- query @Bid supplier
+  assertMsg "supplier sees all sealed bids" (length supplierBids == 2)
+
+  -- A second auction on the SAME invoice, bid and all, set up before the
+  -- first resolves — used for the double-finance check in (6).
+  auction2 <- submit supplier (createCmd Auction with
+                supplier; invoiceCid = ackInv; invoiceId = "INV-001"
+                faceAmount = 100.0; currency = "USD"; dueDate = due
+                financiers = [financierB])
+  [inviteB2] <- submit supplier (exerciseCmd auction2 Auction_CreateInvites)
+  bidB2 <- submit financierB (exerciseCmd inviteB2 BidInvite_PlaceBid with amount = 97.0)
+
+  -- (1) HAPPY PATH: the supplier accepts financier A's 95.0 in one
+  -- transaction: invoice consumed, cash minted, receivable created,
+  -- losing bid retired, outcomes emitted.
+  _ <- submit supplier (exerciseCmd auction Auction_Accept with
+         winningBidCid = bidA; losingBidCids = [bidB])
+
   supplierCash <- queryFilter @Cash supplier (\c -> c.owner == supplier)
   case supplierCash of
     [(_, c)] -> do
-      assertMsg "advance must come from financier A" (c.issuer == financierA)
-      assertMsg "advance amount must match the offer" (c.amount == 95.0)
-      assertMsg "advance currency must match the offer" (c.currency == "USD")
-    _ -> assertFail "supplier should hold exactly one Cash after financing"
+      assertMsg "advance issued by the winning financier" (c.issuer == financierA)
+      assertMsg "advance at the winning amount" (c.amount == 95.0)
+    _ -> assertFail "supplier must hold exactly one Cash after acceptance"
 
-  -- Accept offer B on the now-consumed invoice: MUST FAIL.
-  submitMustFail supplier (exerciseCmd offerB FinancingOffer_Accept)
+  receivables <- query @FinancedReceivable supplier
+  case receivables of
+    [(_, r)] -> do
+      assertMsg "receivable held by the winner" (r.financier == financierA)
+      assertMsg "receivable records the advance" (r.advanceAmount == 95.0)
+    _ -> assertFail "exactly one FinancedReceivable must exist"
+
+  remainingInvoices <- query @AcknowledgedInvoice supplier
+  assertMsg "the acknowledged invoice was consumed" (null remainingInvoices)
+
+  -- (4) EVERY INVITED FINANCIER GETS AN OUTCOME. Winner sees Won with the
+  -- amount; the loser sees NotSelected with no amount disclosed.
+  aOutcomes <- query @OfferOutcome financierA
+  case aOutcomes of
+    [(_, o)] -> do
+      assertMsg "A won" (o.result == Won)
+      assertMsg "A sees the winning amount" (o.amount == Some 95.0)
+    _ -> assertFail "financier A must have exactly one outcome"
+  bOutcomes <- query @OfferOutcome financierB
+  case bOutcomes of
+    [(bOutCid, o)] -> do
+      assertMsg "B was not selected" (o.result == NotSelected)
+      assertMsg "the winning amount is not disclosed to B" (isNone o.amount)
+
+      -- (5) DISMISSIBLE: the addressed financier archives their own notice.
+      submit financierB (exerciseCmd bOutCid OfferOutcome_Dismiss)
+    _ -> assertFail "financier B must have exactly one outcome"
+  bAfterDismiss <- query @OfferOutcome financierB
+  assertMsg "B's outcome is gone after dismissal" (null bAfterDismiss)
+
+  -- (6) DOUBLE-FINANCE STILL BLOCKED AT THE INVOICE LEVEL. The second
+  -- auction references the same AcknowledgedInvoice, which acceptance of the
+  -- first already consumed — resolving it MUST fail.
+  submitMustFail supplier (exerciseCmd auction2 Auction_Accept with
+    winningBidCid = bidB2; losingBidCids = [])
 
   pure ()
