@@ -1,1 +1,4 @@
 .daml/
+log/
+web/node_modules/
+web/.next/
